@@ -1009,6 +1009,191 @@ class StockTest(StockTestBase):
         self.assertEqual(item_next.serial_int, 101)
         self.assertEqual(item_prev.serial_int, 99)
 
+    def test_manufacturer_serial(self):
+        """Tests for the manufacturer_serial field."""
+        p = Part.objects.create(
+            name='mfg serial part',
+            description='A part which records manufacturer serial numbers',
+            trackable=True,
+        )
+
+        # The field is optional
+        item = StockItem.objects.create(part=p, quantity=1)
+        self.assertIsNone(item.manufacturer_serial)
+
+        # A value is stored and read back
+        item.manufacturer_serial = 'MFG-001'
+        item.save()
+        item.refresh_from_db()
+        self.assertEqual(item.manufacturer_serial, 'MFG-001')
+
+        # Surrounding whitespace is stripped during validation
+        item.manufacturer_serial = '  MFG-001  '
+        item.full_clean()
+        self.assertEqual(item.manufacturer_serial, 'MFG-001')
+
+    def test_manufacturer_serial_unique_per_part(self):
+        """The same manufacturer serial cannot be used twice for one part."""
+        p = Part.objects.create(
+            name='mfg serial part',
+            description='A part which records manufacturer serial numbers',
+            trackable=True,
+        )
+
+        StockItem.objects.create(part=p, quantity=1, manufacturer_serial='MFG-001')
+
+        item = StockItem(part=p, quantity=1, manufacturer_serial='MFG-001')
+
+        with self.assertRaises(ValidationError) as cm:
+            item.full_clean()
+
+        self.assertIn('manufacturer_serial', cm.exception.message_dict)
+
+    def test_manufacturer_serial_allowed_across_parts(self):
+        """Different parts may share a manufacturer serial number.
+
+        Different manufacturers legitimately reuse serial strings, so
+        uniqueness is scoped to the part rather than enforced globally.
+        """
+        p1 = Part.objects.create(
+            name='mfg serial part 1', description='First part', trackable=True
+        )
+        p2 = Part.objects.create(
+            name='mfg serial part 2', description='Second part', trackable=True
+        )
+
+        StockItem.objects.create(part=p1, quantity=1, manufacturer_serial='MFG-001')
+
+        item = StockItem(part=p2, quantity=1, manufacturer_serial='MFG-001')
+        item.full_clean()
+        item.save()
+
+        self.assertEqual(
+            StockItem.objects.filter(manufacturer_serial='MFG-001').count(), 2
+        )
+
+    def test_manufacturer_serial_blank_does_not_collide(self):
+        """Multiple items may omit the manufacturer serial number."""
+        p = Part.objects.create(
+            name='mfg serial part',
+            description='A part which records manufacturer serial numbers',
+            trackable=True,
+        )
+
+        for _idx in range(3):
+            item = StockItem(part=p, quantity=1)
+            item.full_clean()
+            item.save()
+
+        self.assertEqual(StockItem.objects.filter(part=p).count(), 3)
+
+    def test_manufacturer_serial_update_self(self):
+        """Re-saving an item must not conflict with its own serial number."""
+        p = Part.objects.create(
+            name='mfg serial part',
+            description='A part which records manufacturer serial numbers',
+            trackable=True,
+        )
+
+        item = StockItem.objects.create(
+            part=p, quantity=1, manufacturer_serial='MFG-001'
+        )
+
+        # Validating the existing item against itself must not raise
+        item.full_clean()
+        item.save()
+
+        self.assertEqual(item.manufacturer_serial, 'MFG-001')
+
+    def test_manufacturer_serial_bulk_create(self):
+        """Manufacturer serial numbers can be assigned in bulk, one per created item."""
+        p = Part.objects.create(
+            name='mfg serial bulk part',
+            description='A part which records manufacturer serial numbers',
+            trackable=True,
+        )
+
+        items = StockItem._create_serial_numbers(
+            ['1', '2', '3'], manufacturer_serials=['A1', 'A2', 'A3'], part=p
+        )
+
+        self.assertEqual(items.count(), 3)
+        self.assertEqual(
+            {item.serial: item.manufacturer_serial for item in items},
+            {'1': 'A1', '2': 'A2', '3': 'A3'},
+        )
+
+        # The number of manufacturer serials must match the number of items
+        with self.assertRaises(ValidationError) as cm:
+            StockItem._create_serial_numbers(
+                ['4', '5'], manufacturer_serials=['B1'], part=p
+            )
+
+        self.assertIn('manufacturer_serial_numbers', cm.exception.message_dict)
+
+        # A manufacturer serial which already exists for this part is rejected,
+        # and nothing is created
+        with self.assertRaises(ValidationError) as cm:
+            StockItem._create_serial_numbers(
+                ['4', '5'], manufacturer_serials=['A2', 'B2'], part=p
+            )
+
+        self.assertIn(
+            'A2', str(cm.exception.message_dict['manufacturer_serial_numbers'])
+        )
+        self.assertFalse(StockItem.objects.filter(part=p, serial='4').exists())
+        self.assertEqual(StockItem.objects.filter(part=p).count(), 3)
+
+        # Items may be created with manufacturer serials only (no native serial),
+        # and the same manufacturer serials are fine on a different part
+        p2 = Part.objects.create(
+            name='mfg serial bulk part 2', description='Second part', trackable=False
+        )
+
+        items = StockItem._create_serial_numbers(
+            [None, None], manufacturer_serials=['A1', 'A2'], part=p2
+        )
+
+        self.assertEqual(items.count(), 2)
+
+        for item in items:
+            self.assertIsNone(item.serial)
+            self.assertEqual(item.quantity, 1)
+            self.assertIn(item.manufacturer_serial, ['A1', 'A2'])
+
+    def test_serialize_stock_with_manufacturer_serials(self):
+        """Serializing an existing item can assign manufacturer serial numbers."""
+        p = Part.objects.create(
+            name='mfg serialize part',
+            description='A part which records manufacturer serial numbers',
+            trackable=True,
+        )
+
+        parent = StockItem.objects.create(
+            part=p, quantity=5, manufacturer_serial='PARENT'
+        )
+
+        children = parent.serializeStock(
+            3, ['10', '11', '12'], manufacturer_serials=['M10', 'M11', 'M12']
+        )
+
+        self.assertEqual(
+            {item.serial: item.manufacturer_serial for item in children},
+            {'10': 'M10', '11': 'M11', '12': 'M12'},
+        )
+
+        parent.refresh_from_db()
+        self.assertEqual(parent.quantity, 2)
+
+        # Without manufacturer serials, the parent value is *not* copied to the
+        # children - a manufacturer serial identifies a single physical item
+        children = parent.serializeStock(2, ['13', '14'])
+
+        self.assertEqual(len(children), 2)
+
+        for item in children:
+            self.assertIsNone(item.manufacturer_serial)
+
     def test_serialize_stock_invalid(self):
         """Test manual serialization of parts.
 

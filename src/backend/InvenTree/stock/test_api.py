@@ -879,6 +879,189 @@ class StockItemListTest(StockAPITestCase):
         response = self.get_stock(batch='B123')
         self.assertEqual(len(response), 1)
 
+    def test_manufacturer_serial(self):
+        """Test the manufacturer_serial field via the API.
+
+        The field must be writeable at creation time, filterable, and
+        included in the search fields.
+        """
+        part = Part.objects.filter(trackable=True).first()
+
+        response = self.client.post(
+            self.list_url,
+            {'part': part.pk, 'quantity': 1, 'manufacturer_serial': 'API-MFG-001'},
+            expected_code=201,
+        )
+
+        # Bulk-capable create endpoints may return a list
+        data = response.data[0] if isinstance(response.data, list) else response.data
+        self.assertEqual(data['manufacturer_serial'], 'API-MFG-001')
+
+        # Exact-match filter
+        results = self.get_stock(manufacturer_serial='API-MFG-001')
+        self.assertEqual(len(results), 1)
+
+        # Included in the general search fields
+        results = self.get_stock(search='API-MFG-001')
+        self.assertEqual(len(results), 1)
+
+    def test_manufacturer_serial_numbers_create(self):
+        """Multiple items can be created with manufacturer serial numbers.
+
+        The 'manufacturer_serial_numbers' field accepts the same syntax as
+        the native 'serial_numbers' field (individual values and ranges).
+        """
+        trackable_part = part.models.Part.objects.create(
+            name='mfg serial ranges part',
+            description='A trackable part',
+            trackable=True,
+        )
+
+        # Quantity must match the number of manufacturer serials
+        response = self.post(
+            self.list_url,
+            data={
+                'part': trackable_part.pk,
+                'quantity': 5,
+                'manufacturer_serial_numbers': '1-50',
+            },
+            expected_code=400,
+        )
+        self.assertIn('manufacturer_serial_numbers', response.data)
+
+        # Ranges with gaps, native syntax
+        response = self.post(
+            self.list_url,
+            data={
+                'part': trackable_part.pk,
+                'quantity': 6,
+                'manufacturer_serial_numbers': 'MA1-MA3, MA7, MA9-MA10',
+            },
+            expected_code=201,
+        )
+
+        data = response.data
+        self.assertEqual(len(data), 6)
+        self.assertEqual(
+            sorted(item['manufacturer_serial'] for item in data),
+            sorted(['MA1', 'MA2', 'MA3', 'MA7', 'MA9', 'MA10']),
+        )
+
+        for item in data:
+            self.assertEqual(float(item['quantity']), 1)
+            self.assertIsNone(item['serial'])
+
+        # A manufacturer serial already used for this part is rejected, and
+        # nothing is created
+        response = self.post(
+            self.list_url,
+            data={
+                'part': trackable_part.pk,
+                'quantity': 2,
+                'manufacturer_serial_numbers': 'MA7, MA8',
+            },
+            expected_code=400,
+        )
+        self.assertIn('MA7', str(response.data['manufacturer_serial_numbers']))
+        self.assertEqual(trackable_part.stock_entries().count(), 6)
+
+        # Combined with native serial numbers - pairs are assigned in order
+        response = self.post(
+            self.list_url,
+            data={
+                'part': trackable_part.pk,
+                'quantity': 3,
+                'serial_numbers': '100-102',
+                'manufacturer_serial_numbers': 'X1,X2,X3',
+            },
+            expected_code=201,
+        )
+        self.assertEqual(
+            {item['serial']: item['manufacturer_serial'] for item in response.data},
+            {'100': 'X1', '101': 'X2', '102': 'X3'},
+        )
+
+        # A single manufacturer serial cannot be shared by multiple serialized items
+        response = self.post(
+            self.list_url,
+            data={
+                'part': trackable_part.pk,
+                'quantity': 2,
+                'serial_numbers': '200-201',
+                'manufacturer_serial': 'ONE',
+            },
+            expected_code=400,
+        )
+        self.assertIn('manufacturer_serial', response.data)
+
+        # Non-trackable parts may also receive per-item manufacturer serials
+        plain_part = part.models.Part.objects.create(
+            name='mfg serial plain part',
+            description='A non-trackable part',
+            trackable=False,
+        )
+
+        response = self.post(
+            self.list_url,
+            data={
+                'part': plain_part.pk,
+                'quantity': 2,
+                'manufacturer_serial_numbers': 'P1,P2',
+            },
+            expected_code=201,
+        )
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(
+            sorted(item['manufacturer_serial'] for item in response.data), ['P1', 'P2']
+        )
+
+    def test_manufacturer_serial_numbers_serialize(self):
+        """The serialize endpoint accepts manufacturer serial numbers."""
+        # Stock item 100: part 25 (trackable), quantity 10, location 7
+        item = StockItem.objects.get(pk=100)
+        url = reverse('api-stock-item-serialize', kwargs={'pk': item.pk})
+
+        # Count mismatch
+        response = self.post(
+            url,
+            data={
+                'quantity': 3,
+                'serial_numbers': '901-903',
+                'manufacturer_serial_numbers': 'Z1-Z2',
+                'destination': item.location.pk,
+            },
+            expected_code=400,
+        )
+        self.assertIn('manufacturer_serial_numbers', response.data)
+
+        response = self.post(
+            url,
+            data={
+                'quantity': 3,
+                'serial_numbers': '901-903',
+                'manufacturer_serial_numbers': 'Z1-Z3',
+                'destination': item.location.pk,
+            },
+            expected_code=201,
+        )
+        self.assertEqual(
+            {i['serial']: i['manufacturer_serial'] for i in response.data},
+            {'901': 'Z1', '902': 'Z2', '903': 'Z3'},
+        )
+
+        # An existing manufacturer serial (for this part) is rejected
+        response = self.post(
+            url,
+            data={
+                'quantity': 1,
+                'serial_numbers': '904',
+                'manufacturer_serial_numbers': 'Z2',
+                'destination': item.location.pk,
+            },
+            expected_code=400,
+        )
+        self.assertIn('Z2', str(response.data['manufacturer_serial_numbers']))
+
     def test_filter_by_company(self):
         """Test that we can filter stock items by company."""
         for cmp in company.models.Company.objects.all():

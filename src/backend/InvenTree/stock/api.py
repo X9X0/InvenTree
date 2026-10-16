@@ -808,6 +808,12 @@ class StockFilter(FilterSet):
         label='Serial number', field_name='serial', lookup_expr='exact'
     )
 
+    manufacturer_serial = rest_filters.CharFilter(
+        label='Manufacturer serial number',
+        field_name='manufacturer_serial',
+        lookup_expr='exact',
+    )
+
     serialized = rest_filters.BooleanFilter(
         label='Has serial number', method='filter_serialized'
     )
@@ -1252,7 +1258,49 @@ class StockList(
                     'serial_numbers': e.messages,
                 })
 
-        if serials is not None:
+        # Manufacturer serial numbers: optional, one per created item, and (like
+        # 'serial_numbers') expressed as individual values or ranges. Unlike
+        # native serials they do not require a trackable part.
+        manufacturer_serials = None
+
+        manufacturer_serial_numbers = data.pop('manufacturer_serial_numbers', '')
+
+        if manufacturer_serial_numbers:
+            # The per-item list supersedes the single-value field
+            data.pop('manufacturer_serial', None)
+
+            try:
+                manufacturer_serials = extract_serial_numbers(
+                    manufacturer_serial_numbers, quantity, None, part=part
+                )
+            except DjangoValidationError as e:
+                raise ValidationError({
+                    'quantity': e.messages,
+                    'manufacturer_serial_numbers': e.messages,
+                })
+
+            conflicts = StockItem.find_conflicting_manufacturer_serials(
+                part, manufacturer_serials
+            )
+
+            if len(conflicts) > 0:
+                msg = _('The following manufacturer serial numbers already exist')
+                msg += ' : '
+                msg += ','.join([str(e) for e in conflicts])
+
+                raise ValidationError({'manufacturer_serial_numbers': [msg]})
+
+        elif serials and data.get('manufacturer_serial'):
+            # A single manufacturer serial cannot be shared by multiple items
+            raise ValidationError({
+                'manufacturer_serial': [
+                    _(
+                        'Use manufacturer_serial_numbers to assign manufacturer serial numbers to multiple items'
+                    )
+                ]
+            })
+
+        if serials is not None or manufacturer_serials is not None:
             """If the stock item is going to be serialized, set the quantity to 1."""
             data['quantity'] = 1
 
@@ -1264,10 +1312,12 @@ class StockList(
         location = serializer.validated_data.get('location', None)
 
         with transaction.atomic():
-            if serials:
+            if serials or manufacturer_serials:
                 # Create multiple serialized StockItem objects
                 items = StockItem._create_serial_numbers(
-                    serials, **serializer.validated_data
+                    serials or [None] * len(manufacturer_serials),
+                    manufacturer_serials=manufacturer_serials,
+                    **serializer.validated_data,
                 )
 
                 # Next, bulk-create stock tracking entries for the newly created items
@@ -1357,6 +1407,7 @@ class StockList(
 
     search_fields = [
         'serial',
+        'manufacturer_serial',
         'batch',
         'location__name',
         'part__name',

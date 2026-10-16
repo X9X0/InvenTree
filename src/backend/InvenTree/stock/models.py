@@ -672,6 +672,35 @@ class StockItem(
             & Q(expiry_date__lt=InvenTree.helpers.current_date())
         )
 
+    @classmethod
+    def find_conflicting_manufacturer_serials(
+        cls, part: PartModels.Part, serials: list, exclude=None
+    ) -> list:
+        """Return those of the provided manufacturer serial numbers which already exist for the part.
+
+        Manufacturer serial numbers are unique *per part* (not per part tree,
+        and not globally): different manufacturers legitimately reuse serial
+        strings, so a wider scope would reject valid data.
+
+        Arguments:
+            part: The Part to check against
+            serials: List of candidate manufacturer serial numbers
+            exclude: Optional StockItem to exclude from the check (e.g. when editing)
+        """
+        serials = [str(s).strip() for s in serials if s]
+
+        if not serials:
+            return []
+
+        items = cls.objects.filter(part=part, manufacturer_serial__in=serials)
+
+        if exclude is not None and exclude.pk is not None:
+            items = items.exclude(pk=exclude.pk)
+
+        existing = set(items.values_list('manufacturer_serial', flat=True))
+
+        return [s for s in serials if s in existing]
+
     @staticmethod
     def _lock_serial_numbers(part: PartModels.Part, serials: list) -> None:
         """Serialize concurrent serial number creation, and re-validate under the lock.
@@ -734,11 +763,14 @@ class StockItem(
 
     @classmethod
     @transaction.atomic
-    def _create_serial_numbers(cls, serials: list, **kwargs) -> QuerySet:
+    def _create_serial_numbers(
+        cls, serials: list, manufacturer_serials: list | None = None, **kwargs
+    ) -> QuerySet:
         """Create multiple stock items with the provided serial numbers.
 
         Arguments:
             serials: List of serial numbers to create
+            manufacturer_serials: Optional list of manufacturer serial numbers (one per item, same order)
             **kwargs: Additional keyword arguments to pass to the StockItem creation function
 
         Returns:
@@ -803,9 +835,37 @@ class StockItem(
         if 'part' not in data:
             raise ValidationError({'part': _('Part must be specified')})
 
+        # A manufacturer serial identifies one physical item, so it is never
+        # copied across from a parent item - it is assigned per item below.
+        data.pop('manufacturer_serial', None)
+
+        if manufacturer_serials is not None:
+            manufacturer_serials = [str(x).strip() for x in manufacturer_serials]
+
+            if len(manufacturer_serials) != len(serials):
+                raise ValidationError({
+                    'manufacturer_serial_numbers': _(
+                        'Number of manufacturer serial numbers must match quantity'
+                    )
+                })
+
         # Serialize against any other concurrent request creating an
-        # overlapping set of serial numbers, and re-validate under that lock
-        cls._lock_serial_numbers(data['part'], serials)
+        # overlapping set of serial numbers, and re-validate under that lock.
+        # Serial values may be None here (items created with only manufacturer
+        # serial numbers) - the lock is still taken, so the manufacturer serial
+        # re-check below is protected too.
+        cls._lock_serial_numbers(data['part'], [sn for sn in serials if sn is not None])
+
+        if manufacturer_serials:
+            conflicts = cls.find_conflicting_manufacturer_serials(
+                data['part'], manufacturer_serials
+            )
+
+            if conflicts:
+                msg = _('The following manufacturer serial numbers already exist')
+                msg += ' : '
+                msg += ','.join(str(x) for x in conflicts)
+                raise ValidationError({'manufacturer_serial_numbers': msg})
 
         parent = kwargs.pop('parent', None) or data.get('parent')
 
@@ -814,8 +874,11 @@ class StockItem(
         # Force single quantity for each item
         data['quantity'] = 1
 
-        for serial in serials:
+        for idx, serial in enumerate(serials):
             data['serial'] = serial
+
+            if manufacturer_serials:
+                data['manufacturer_serial'] = manufacturer_serials[idx]
 
             if serial is not None:
                 data['serial_int'] = StockItem.convert_serial_to_int(serial) or 0
@@ -988,6 +1051,27 @@ class StockItem(
                 self.part.validate_serial_number(self.serial, self, raise_error=True)
             except ValidationError as exc:
                 raise ValidationError({'serial': exc.message})
+
+        # Manufacturer serial number must be unique for this part.
+        # Enforced in application code (not a DB constraint) so blank values do
+        # not collide and pre-existing duplicates do not block migration.
+        if self.manufacturer_serial:
+            self.manufacturer_serial = str(self.manufacturer_serial).strip()
+
+            if self.part_id is not None:
+                items = StockItem.objects.filter(
+                    part=self.part, manufacturer_serial=self.manufacturer_serial
+                )
+
+                if self.pk is not None:
+                    items = items.exclude(pk=self.pk)
+
+                if items.exists():
+                    raise ValidationError({
+                        'manufacturer_serial': _(
+                            'Manufacturer serial number already exists for this part'
+                        )
+                    })
 
     def validate_batch_code(self):
         """Ensure that the batch code is valid for this StockItem.
@@ -1227,6 +1311,14 @@ class StockItem(
     )
 
     serial_int = models.IntegerField(default=0)
+
+    manufacturer_serial = models.CharField(
+        verbose_name=_('Manufacturer Serial Number'),
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text=_('Serial number assigned by the manufacturer'),
+    )
 
     link = InvenTreeURLField(
         verbose_name=_('External Link'),
@@ -2406,6 +2498,7 @@ class StockItem(
         user: User | None = None,
         notes: str | None = '',
         location: StockLocation | None = None,
+        manufacturer_serials: list[str] | None = None,
     ):
         """Split this stock item into unique serial numbers.
 
@@ -2419,6 +2512,7 @@ class StockItem(
             user: User object associated with action
             notes: Optional notes for tracking
             location: If specified, serialized items will be placed in the given location
+            manufacturer_serials: Optional list of manufacturer serial numbers (one per serial, same order)
 
         Returns:
             List of newly created StockItem objects, each with a unique serial number.
@@ -2484,7 +2578,9 @@ class StockItem(
         data['parent'] = self
 
         # Generate a new serial number for each item
-        items = StockItem._create_serial_numbers(serials, **data)
+        items = StockItem._create_serial_numbers(
+            serials, manufacturer_serials=manufacturer_serials, **data
+        )
 
         # Create a new tracking entry for each item
         history_items = []

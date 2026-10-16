@@ -90,6 +90,13 @@ function stockItemTableColumns({
     }),
     StatusColumn({ model: ModelType.stockitem }),
     {
+      accessor: 'manufacturer_serial',
+      title: t`Manufacturer Serial Number`,
+      sortable: true,
+      copyable: true,
+      defaultVisible: false
+    },
+    {
       accessor: 'batch',
       sortable: true,
       copyable: true,

@@ -341,7 +341,12 @@ class StockItemSerializer(
         'supplier_part_detail.MPN',
     ]
 
-    import_exclude_fields = ['location_path', 'serial_numbers', 'use_pack_size']
+    import_exclude_fields = [
+        'location_path',
+        'serial_numbers',
+        'manufacturer_serial_numbers',
+        'use_pack_size',
+    ]
 
     class Meta:
         """Metaclass options."""
@@ -352,6 +357,7 @@ class StockItemSerializer(
             'part',
             'quantity',
             'serial',
+            'manufacturer_serial',
             'batch',
             'location',
             'belongs_to',
@@ -385,6 +391,7 @@ class StockItemSerializer(
             'purchase_price_currency',
             'use_pack_size',
             'serial_numbers',
+            'manufacturer_serial_numbers',
             # Annotated fields
             'allocated',
             'expired',
@@ -415,6 +422,7 @@ class StockItemSerializer(
         extra_kwargs = {
             'use_pack_size': {'write_only': True},
             'serial_numbers': {'write_only': True},
+            'manufacturer_serial_numbers': {'write_only': True},
         }
         """
         Fields used when creating a stock item
@@ -470,6 +478,17 @@ class StockItemSerializer(
         required=False,
         allow_null=True,
         help_text=_('Enter serial numbers for new items'),
+    )
+
+    manufacturer_serial_numbers = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        label=_('Manufacturer Serial Numbers'),
+        help_text=_(
+            'Enter manufacturer serial numbers for new items (one per item, ranges allowed)'
+        ),
     )
 
     def validate_part(self, part):
@@ -704,7 +723,13 @@ class SerializeStockItemSerializer(serializers.Serializer):
     class Meta:
         """Metaclass options."""
 
-        fields = ['quantity', 'serial_numbers', 'destination', 'notes']
+        fields = [
+            'quantity',
+            'serial_numbers',
+            'manufacturer_serial_numbers',
+            'destination',
+            'notes',
+        ]
 
     quantity = serializers.IntegerField(
         min_value=0,
@@ -736,6 +761,15 @@ class SerializeStockItemSerializer(serializers.Serializer):
         help_text=_('Enter serial numbers for new items'),
         allow_blank=False,
         required=True,
+    )
+
+    manufacturer_serial_numbers = serializers.CharField(
+        label=_('Manufacturer Serial Numbers'),
+        help_text=_(
+            'Enter manufacturer serial numbers for new items (one per item, ranges allowed)'
+        ),
+        allow_blank=True,
+        required=False,
     )
 
     destination = serializers.PrimaryKeyRelatedField(
@@ -788,6 +822,25 @@ class SerializeStockItemSerializer(serializers.Serializer):
 
             raise ValidationError({'serial_numbers': error})
 
+        # Optional manufacturer serial numbers: one per item, unique per part
+        if data.get('manufacturer_serial_numbers'):
+            try:
+                manufacturer_serials = InvenTree.helpers.extract_serial_numbers(
+                    data['manufacturer_serial_numbers'], quantity, None, part=item.part
+                )
+            except DjangoValidationError as e:
+                raise ValidationError({'manufacturer_serial_numbers': e.messages})
+
+            existing = StockItem.find_conflicting_manufacturer_serials(
+                item.part, manufacturer_serials
+            )
+
+            if len(existing) > 0:
+                exists = ','.join([str(x) for x in existing])
+                error = _('Manufacturer serial numbers already exist') + ': ' + exists
+
+                raise ValidationError({'manufacturer_serial_numbers': error})
+
         return data
 
     def save(self) -> list[StockItem]:
@@ -813,6 +866,16 @@ class SerializeStockItemSerializer(serializers.Serializer):
             part=item.part,
         )
 
+        manufacturer_serials = None
+
+        if data.get('manufacturer_serial_numbers'):
+            manufacturer_serials = InvenTree.helpers.extract_serial_numbers(
+                data['manufacturer_serial_numbers'],
+                data['quantity'],
+                None,
+                part=item.part,
+            )
+
         with (
             transaction.atomic(),
             batch_events(),
@@ -826,6 +889,7 @@ class SerializeStockItemSerializer(serializers.Serializer):
                     user=user,
                     notes=data.get('notes', ''),
                     location=data['destination'],
+                    manufacturer_serials=manufacturer_serials,
                 )
                 or []
             )
