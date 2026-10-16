@@ -280,6 +280,16 @@ export function useStockFields({
           partInstance.trackable == false ||
           (stockItem?.quantity != undefined && stockItem?.quantity != 1)
       },
+      manufacturer_serial_numbers: {
+        field_type: 'string',
+        label: t`Manufacturer Serial Numbers`,
+        description: t`Enter manufacturer serial numbers for new stock, one per item (or leave blank)`,
+        required: false,
+        hidden: !create
+      },
+      manufacturer_serial: {
+        hidden: create
+      },
       batch: {
         default: '',
         placeholderAutofill: true,
@@ -332,6 +342,7 @@ export function useStockFields({
 
     if (!create) {
       delete fields.serial_numbers;
+      delete fields.manufacturer_serial_numbers;
     }
 
     // Additional fields for stock item duplication
@@ -486,6 +497,7 @@ export function useStockItemSerializeFields({
         placeholder: serialGenerator.result && `${serialGenerator.result}+`,
         placeholderAutofill: true
       },
+      manufacturer_serial_numbers: {},
       destination: {}
     };
   }, [serialGenerator.result]);

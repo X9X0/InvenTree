@@ -192,6 +192,14 @@ export function StockDetailsPanel({
       })
     },
     {
+      type: 'text',
+      name: 'manufacturer_serial',
+      icon: 'serial',
+      label: t`Manufacturer Serial Number`,
+      copy: true,
+      hidden: !instance?.manufacturer_serial
+    },
+    {
       type: 'number',
       name: 'quantity',
       label: t`Quantity`,
